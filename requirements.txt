@@ -1,0 +1,70 @@
+"""Live-Client für aktuelle Messwerte (Streaming-Quelle).
+
+Während die Archiv-API (``open_meteo.py``) historische Stundenwerte als
+Batch liefert, fragt dieser Client den *aktuellen* Zustand über die
+Forecast- und Luftqualitäts-Endpunkte von Open-Meteo ab. Jeder Abruf
+liefert genau einen Messwert je Stadt und bildet damit ein einzelnes
+Ereignis ("Event") des Datenstroms. Es werden ausschließlich echte
+Daten von Open-Meteo verwendet.
+"""
+from __future__ import annotations
+
+from datetime import datetime
+
+import numpy as np
+import pandas as pd
+
+from config import AIR_QUALITY_VARIABLES, NUMERIC_COLUMNS, POLLEN_VARIABLES, WEATHER_VARIABLES
+from src.open_meteo import Location, _get_json
+from src.pollen import fetch_pollen_current
+
+FORECAST_ENDPOINT = "https://api.open-meteo.com/v1/forecast"
+AIR_QUALITY_ENDPOINT = "https://air-quality-api.open-meteo.com/v1/air-quality"
+
+Event = dict[str, object]
+
+
+def fetch_current(location: Location) -> Event:
+    """Ruft den aktuellen Wetter-, Luftqualitäts- und Pollenzustand einer Stadt ab."""
+    weather = _get_json(FORECAST_ENDPOINT, {
+        "latitude": location.latitude,
+        "longitude": location.longitude,
+        "current": ",".join(WEATHER_VARIABLES),
+        "timezone": "Europe/Berlin",
+    }).get("current", {})
+
+    air = _get_json(AIR_QUALITY_ENDPOINT, {
+        "latitude": location.latitude,
+        "longitude": location.longitude,
+        "current": ",".join(AIR_QUALITY_VARIABLES),
+        "timezone": "Europe/Berlin",
+        "domains": "auto",
+    }).get("current", {})
+
+    # Zweite Datenquelle: aktuelle Pollenwerte (optional, bei Fehler leer).
+    try:
+        pollen = fetch_pollen_current(location)
+    except Exception:
+        pollen = {}
+
+    timestamp = weather.get("time") or air.get("time") or datetime.now().isoformat(timespec="minutes")
+    event: Event = {"timestamp": timestamp, "city": location.city}
+    for var in WEATHER_VARIABLES:
+        event[var] = weather.get(var)
+    for var in AIR_QUALITY_VARIABLES:
+        event[var] = air.get(var)
+    for var in POLLEN_VARIABLES:
+        event[var] = pollen.get(var)
+    return event
+
+
+def events_to_frame(events: list[Event]) -> pd.DataFrame:
+    """Wandelt eine Liste von Events in einen DataFrame im kanonischen Format um."""
+    if not events:
+        return pd.DataFrame()
+    df = pd.DataFrame(events)
+    # Sicherstellen, dass alle erwarteten numerischen Spalten existieren.
+    for col in NUMERIC_COLUMNS:
+        if col not in df.columns:
+            df[col] = np.nan
+    return df

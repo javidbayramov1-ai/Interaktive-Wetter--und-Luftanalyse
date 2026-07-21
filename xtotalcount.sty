@@ -1,0 +1,205 @@
+"""Anforderungsbasierte Evaluation für die Projektarbeit.
+
+Erzeugt alle Kennzahlen für Kapitel 7 (Evaluation) reproduzierbar aus der
+gespeicherten Datenbank (echte, zuvor geladene Open-Meteo-Daten).
+
+Verwendung:
+    python evaluation.py                        # nutzt data/weather_air_quality.sqlite
+    python evaluation.py --db pfad/zur.sqlite
+    python evaluation.py --measure-fetch Aalen  # misst einmalig die Abrufdauer (benötigt Internet)
+"""
+from __future__ import annotations
+
+import argparse
+import time
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+
+from src.analysis import city_summary, correlation_matrix
+from src.city_catalog import CITY_COORDS
+from src.features import NUMERIC_COLUMNS, data_quality_report, enrich
+from src.storage import DEFAULT_DB_PATH, load_measurements
+
+REQUIRED_FEATURE_COLUMNS = ["timestamp", "city", "hour", "weekday", "aqi_category"]
+GUI_WIDGETS = ["st.multiselect", "st.date_input", "st.selectbox"]
+
+
+def _resolve_db(db_arg: str | None) -> Path:
+    return Path(db_arg) if db_arg else DEFAULT_DB_PATH
+
+
+def _status(ok: bool) -> str:
+    return "erfuellt" if ok else "OFFEN"
+
+
+def _median_step_minutes(df: pd.DataFrame) -> float | None:
+    if "timestamp" not in df.columns or df.empty:
+        return None
+    one_city = df[df["city"] == df["city"].iloc[0]].sort_values("timestamp")
+    diffs = one_city["timestamp"].diff().dropna()
+    if diffs.empty:
+        return None
+    return diffs.dt.total_seconds().median() / 60.0
+
+
+def evaluate_requirements(df: pd.DataFrame, db_path: Path) -> pd.DataFrame:
+    """Prüft jede Anforderung gegen ihr Prüfkriterium und liefert eine Tabelle."""
+    n_cities = df["city"].nunique() if "city" in df.columns else 0
+    step = _median_step_minutes(df)
+    cor = correlation_matrix(df)
+    dq = data_quality_report(df)
+    app_text = Path("app.py").read_text(encoding="utf-8") if Path("app.py").exists() else ""
+    req_text = Path("requirements.txt").read_text(encoding="utf-8") if Path("requirements.txt").exists() else ""
+
+    checks = [
+        ("RQ1", "Stündliche Daten für >= 3 Städte",
+         f"{n_cities} Städte, Schrittweite {step:.0f} min" if step else f"{n_cities} Städte",
+         n_cities >= 3 and step is not None and abs(step - 60) < 1),
+        ("RQ2", "SQLite-DB mit Tabelle 'measurements'",
+         f"{db_path.name} vorhanden, {len(df)} Zeilen",
+         db_path.exists() and len(df) > 0),
+        ("RQ3", "Spalten timestamp, city, hour, weekday, aqi_category",
+         "alle vorhanden" if all(c in df.columns for c in REQUIRED_FEATURE_COLUMNS)
+         else "fehlend: " + ", ".join(c for c in REQUIRED_FEATURE_COLUMNS if c not in df.columns),
+         all(c in df.columns for c in REQUIRED_FEATURE_COLUMNS)),
+        ("RQ4", "GUI-Widgets für Stadt/Zeitraum/Messgröße",
+         ", ".join(w for w in GUI_WIDGETS if w in app_text) or "keine gefunden",
+         all(w in app_text for w in GUI_WIDGETS)),
+        ("RQ5", "Korrelationsmatrix berechenbar",
+         f"{cor.shape[0]}x{cor.shape[1]} Matrix" if not cor.empty else "leer",
+         not cor.empty and cor.shape[0] >= 2),
+        ("RQ6", "Missing-Value-Tabelle",
+         f"max. {dq['missing_percent'].max():.2f} % fehlend" if not dq.empty else "leer",
+         {"missing_values", "missing_percent"}.issubset(dq.columns)),
+        ("RQ7", "Reproduzierbar: requirements.txt + Streamlit-Start",
+         "requirements.txt + app.py vorhanden" if ("streamlit" in req_text and Path("app.py").exists())
+         else "unvollständig",
+         "streamlit" in req_text and Path("app.py").exists()),
+    ]
+    return pd.DataFrame(
+        [(rq, krit, mess, _status(ok)) for rq, krit, mess, ok in checks],
+        columns=["ID", "Prüfkriterium", "Messwert", "Status"],
+    )
+
+
+def descriptive_findings(df: pd.DataFrame) -> dict[str, object]:
+    """Einige interpretierbare Kennzahlen für den Fließtext der Evaluation."""
+    findings: dict[str, object] = {}
+
+    # Stärkste lineare Zusammenhänge (obere Dreiecksmatrix, ohne Diagonale)
+    cor = correlation_matrix(df)
+    if not cor.empty:
+        mask = np.triu(np.ones(cor.shape, dtype=bool), k=1)
+        pairs = (
+            cor.where(pd.DataFrame(mask, index=cor.index, columns=cor.columns))
+            .stack()
+            .reset_index()
+        )
+        pairs.columns = ["var_a", "var_b", "r"]
+        pairs["abs_r"] = pairs["r"].abs()
+        findings["top_correlations"] = (
+            pairs.sort_values("abs_r", ascending=False).head(5)[["var_a", "var_b", "r"]].round(3)
+        )
+
+    # Rush-hour-Effekt auf NO2
+    if "is_rush_hour" in df.columns and "nitrogen_dioxide" in df.columns:
+        grp = df.groupby("is_rush_hour")["nitrogen_dioxide"].mean()
+        if True in grp.index and False in grp.index:
+            findings["no2_rush"] = round(float(grp[True]), 2)
+            findings["no2_offpeak"] = round(float(grp[False]), 2)
+
+    # Niederschlags-Effekt auf PM2.5
+    if "has_precipitation" in df.columns and "pm2_5" in df.columns:
+        grp = df.groupby("has_precipitation")["pm2_5"].mean()
+        if True in grp.index and False in grp.index:
+            findings["pm25_rain"] = round(float(grp[True]), 2)
+            findings["pm25_dry"] = round(float(grp[False]), 2)
+
+    return findings
+
+
+def measure_fetch_latency(city: str) -> float:
+    """Misst die reine Abrufdauer für eine Stadt (benötigt Internet)."""
+    from src.open_meteo import Location, fetch_city_data
+    from datetime import date, timedelta
+
+    if city not in CITY_COORDS:
+        raise SystemExit(f"Unbekannte Stadt: {city}. Verfügbar: {', '.join(CITY_COORDS)}")
+    end = date.today() - timedelta(days=5)
+    start = end - timedelta(days=14)
+    loc = Location(city, CITY_COORDS[city]["latitude"], CITY_COORDS[city]["longitude"])
+    t0 = time.perf_counter()
+    df = fetch_city_data(loc, str(start), str(end))
+    elapsed = time.perf_counter() - t0
+    print(f"RQ1-Performance: {len(df)} Datensätze für {city} in {elapsed:.2f} s "
+          f"({start} bis {end}).")
+    return elapsed
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Evaluation der Projektarbeit")
+    parser.add_argument("--db", default=None, help="Pfad zur SQLite-Datei")
+    parser.add_argument("--measure-fetch", metavar="STADT", default=None,
+                        help="Einmalige Messung der Abrufdauer (benötigt Internet)")
+    args = parser.parse_args()
+
+    if args.measure_fetch:
+        measure_fetch_latency(args.measure_fetch)
+        return
+
+    db_path = _resolve_db(args.db)
+    df = enrich(load_measurements(db_path))
+    if df.empty:
+        print(f"Keine Daten in {db_path}. Zuerst über die Streamlit-App Daten laden.")
+        return
+
+    size_kb = db_path.stat().st_size / 1024 if db_path.exists() else 0
+
+    print("=" * 70)
+    print("EVALUATION – WETTER- UND LUFTQUALITAETS-DASHBOARD")
+    print("=" * 70)
+    print(f"Datenquelle (DB) : {db_path}  ({size_kb:.0f} KB)")
+    print(f"Datensätze       : {len(df)}")
+    print(f"Städte           : {df['city'].nunique()}  ({', '.join(sorted(df['city'].unique()))})")
+    print(f"Zeitraum         : {df['timestamp'].min()}  bis  {df['timestamp'].max()}")
+    print()
+
+    print("--- 7.1 Anforderungsbewertung -------------------------------------")
+    print(evaluate_requirements(df, db_path).to_string(index=False))
+    print()
+
+    print("--- 7.2 Stadtübersicht (deskriptiv) -------------------------------")
+    print(city_summary(df).to_string(index=False))
+    print()
+
+    print("--- 7.3 Korrelationsmatrix ----------------------------------------")
+    cor = correlation_matrix(df)
+    print(cor.to_string())
+    print()
+
+    weather = [c for c in ["temperature_2m", "relative_humidity_2m", "precipitation", "wind_speed_10m"] if c in cor.columns]
+    pollutants = [c for c in ["pm2_5", "pm10", "nitrogen_dioxide", "ozone", "european_aqi"] if c in cor.columns]
+    if weather and pollutants:
+        print("Auszug Wetter x Schadstoffe:")
+        print(cor.loc[weather, pollutants].to_string())
+        print()
+
+    print("--- 7.4 Datenqualität ---------------------------------------------")
+    print(data_quality_report(df).to_string(index=False))
+    print()
+
+    print("--- 7.5 Abgeleitete Befunde (für Interpretation) ------------------")
+    f = descriptive_findings(df)
+    if "top_correlations" in f:
+        print("Stärkste lineare Zusammenhänge:")
+        print(f["top_correlations"].to_string(index=False))
+    if "no2_rush" in f:
+        print(f"\nNO2 zur Rush Hour: {f['no2_rush']} vs. sonst {f['no2_offpeak']} µg/m³")
+    if "pm25_rain" in f:
+        print(f"PM2.5 bei Niederschlag: {f['pm25_rain']} vs. trocken {f['pm25_dry']} µg/m³")
+
+
+if __name__ == "__main__":
+    main()
